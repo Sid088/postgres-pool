@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { ConnectionOptions } from 'tls';
 
-import type { Connection, QueryResult, QueryResultRow } from 'pg';
+import type { Connection, QueryConfig, QueryResult, QueryResultRow } from 'pg';
 import { Client } from 'pg';
 import type { StrictEventEmitter } from 'strict-event-emitter-types';
 import { v4 } from 'uuid';
@@ -124,13 +124,17 @@ export interface PoolOptionsBase {
    */
   // eslint-disable-next-line @typescript-eslint/naming-convention
   statement_timeout?: number;
+  /**
+   * Specifies max uses of open connection.
+   */
+  maxUses: number;
 }
 
 export interface PoolOptionsExplicit {
   host: string;
   database: string;
   user?: string;
-  password?: string;
+  password?: string | (() => Promise<string> | string) | undefined;
   port?: number;
   poolSize?: number;
   idleTimeoutMillis?: number;
@@ -189,6 +193,7 @@ export type PoolClient = Client & {
   idleTimeoutTimer?: NodeJS.Timer;
   release: (removeConnection?: boolean) => Promise<void>;
   errorHandler: (err: Error) => void;
+  poolUseCount?: number;
 };
 
 export type PoolClientWithConnection = PoolClient & {
@@ -284,6 +289,7 @@ export class Pool extends (EventEmitter as new () => PoolEmitter) {
         // Remove leading @ symbol
         return namedParameterWithSymbols.substring(1);
       },
+      maxUses: Infinity,
     };
 
     const { ssl, ...otherOptions } = options;
@@ -377,68 +383,9 @@ export class Pool extends (EventEmitter as new () => PoolEmitter) {
     ])) as PoolClient;
   }
 
-  /* eslint-disable @typescript-eslint/no-explicit-any */
-  /**
-   * Gets a connection to the database and executes the specified query using named parameters. This method will release the connection back to the pool when the query has finished.
-   * @param {string} text
-   * @param {object} values - Keys represent named parameters in the query
-   */
-  public async query<TRow extends QueryResultRow = any>(text: string, values: { [index: string]: any }): Promise<QueryResult<TRow>>;
-
-  /**
-   * Gets a connection to the database and executes the specified query. This method will release the connection back to the pool when the query has finished.
-   * @param {string} text
-   * @param {object[]} values
-   */
-  public async query<TRow extends QueryResultRow = any>(text: string, values?: any[]): Promise<QueryResult<TRow>>;
-
-  /**
-   * Gets a connection to the database and executes the specified query. This method will release the connection back to the pool when the query has finished.
-   * @param {string} text
-   * @param {object | object[]} values - If an object, keys represent named parameters in the query
-   */
-  public query<TRow extends QueryResultRow = any>(text: string, values?: any[] | { [index: string]: any }): Promise<QueryResult<TRow>> {
-    /* eslint-enable @typescript-eslint/no-explicit-any */
-    if (Array.isArray(values)) {
-      return this._query(text, values);
-    }
-
-    if (!values || !Object.keys(values).length) {
-      return this._query(text);
-    }
-
-    // eslint-disable-next-line @typescript-eslint/prefer-regexp-exec
-    const tokenMatches = text.match(this.options.namedParameterFindRegExp);
-    if (!tokenMatches) {
-      throw new Error('Did not find named parameters in in the query. Expected named parameter form is @foo');
-    }
-
-    // Get unique token names
-    // https://stackoverflow.com/a/45886147/3085
-    const tokens = Array.from(new Set(tokenMatches.map(this.options.getNamedParameterName)));
-
-    const missingParameters: string[] = [];
-    for (const token of tokens) {
-      if (!(token in values)) {
-        missingParameters.push(token);
-      }
-    }
-
-    if (missingParameters.length) {
-      throw new Error(`Missing query parameter(s): ${missingParameters.join(', ')}`);
-    }
-
-    let sql = text.slice();
-    const params = [];
-    let tokenIndex = 1;
-    for (const token of tokens) {
-      sql = sql.replace(this.options.getNamedParameterReplaceRegExp(token), `$${tokenIndex}`);
-      params.push(values[token]);
-
-      tokenIndex += 1;
-    }
-
-    return this._query(sql, params);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  public query<TRow extends QueryResultRow = any, I extends any[] = any[]>(queryConfig: QueryConfig<I>, reconnectQueryStartTime?: [number, number]): Promise<QueryResult<TRow>> {
+    return this._query(queryConfig, reconnectQueryStartTime);
   }
 
   /**
@@ -455,14 +402,14 @@ export class Pool extends (EventEmitter as new () => PoolEmitter) {
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private async _query<TRow extends QueryResultRow = any>(text: string, values?: any[], reconnectQueryStartTime?: [number, number]): Promise<QueryResult<TRow>> {
+  private async _query<TRow extends QueryResultRow = any, I extends any[] = any[]>(queryConfig: QueryConfig<I>, reconnectQueryStartTime?: [number, number]): Promise<QueryResult<TRow>> {
     const connection = await this.connect();
     let removeConnection = false;
     let timeoutError: Error | undefined;
     let connectionError: Error | undefined;
 
     try {
-      const results = await connection.query<TRow>(text, values);
+      const results = await connection.query<TRow>(queryConfig);
       return results;
     } catch (ex) {
       const { message } = ex as Error;
@@ -523,7 +470,7 @@ export class Pool extends (EventEmitter as new () => PoolEmitter) {
       throw connectionError;
     }
 
-    const results = await this._query(text, values, reconnectQueryStartTime);
+    const results = await this._query(queryConfig, reconnectQueryStartTime);
     return results;
   }
 
@@ -548,7 +495,9 @@ export class Pool extends (EventEmitter as new () => PoolEmitter) {
      * @param {boolean} [removeConnection=false]
      */
     client.release = async (removeConnection = false): Promise<void> => {
-      if (this.isEnding || removeConnection) {
+      client.poolUseCount = (client.poolUseCount || 0) + 1;
+
+      if (this.isEnding || removeConnection || client.poolUseCount >= this.options.maxUses) {
         await this._removeConnection(client);
         return;
       }
